@@ -2049,6 +2049,110 @@ def _check_kotlin_imports_one(repo: Path, relative_path: str) -> Optional[str]:
     )
 
 
+# Canonical `<header>` for each `std::<symbol>` we know how to spot.
+# Keep narrow — only symbols where the mapping is unambiguous in modern C++.
+_CPP_STD_HEADER_MAP = {
+    "vector": ("vector",),
+    "array": ("array",),
+    "string": ("string",),
+    "stoi": ("string",),
+    "string_view": ("string_view",),
+    "map": ("map",),
+    "multimap": ("map",),
+    "unordered_map": ("unordered_map",),
+    "set": ("set",),
+    "multiset": ("set",),
+    "unordered_set": ("unordered_set",),
+    "pair": ("utility",),
+    "make_pair": ("utility",),
+    "move": ("utility",),
+    "tuple": ("tuple",),
+    "function": ("functional",),
+    "bind": ("functional",),
+    "shared_ptr": ("memory",),
+    "unique_ptr": ("memory",),
+    "weak_ptr": ("memory",),
+    "make_shared": ("memory",),
+    "make_unique": ("memory",),
+    "sort": ("algorithm",),
+    "find": ("algorithm",),
+    "find_if": ("algorithm",),
+    "min_element": ("algorithm",),
+    "max_element": ("algorithm",),
+    "count": ("algorithm",),
+    "count_if": ("algorithm",),
+    "cout": ("iostream",),
+    "cerr": ("iostream",),
+    "cin": ("iostream",),
+    "endl": ("iostream",),
+    "ostringstream": ("sstream",),
+    "istringstream": ("sstream",),
+    "stringstream": ("sstream",),
+    "thread": ("thread",),
+    "mutex": ("mutex",),
+    "lock_guard": ("mutex",),
+    "atomic": ("atomic",),
+    "chrono": ("chrono",),
+}
+_CPP_SUFFIXES = {".h", ".hpp", ".hh", ".hxx", ".cpp", ".cc", ".cxx", ".c++"}
+
+
+def _check_cpp_include_order_one(repo: Path, relative_path: str) -> Optional[str]:
+    """Flag `std::<symbol>` whose first use appears BEFORE its canonical
+    `#include <header>` line, or where the include is missing entirely.
+
+    Catches the common refactor-into-header-file bug where the model writes
+    the implementation first and forgets to hoist the include to the top of
+    the file (or never adds it at all).
+    """
+    full = (repo / relative_path).resolve()
+    try:
+        full.relative_to(repo.resolve())
+    except (ValueError, RuntimeError):
+        return None
+    if not full.exists():
+        return None
+    try:
+        source = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    lines = source.splitlines()
+    include_first_idx: Dict[str, int] = {}
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*#\s*include\s+[<\"]([^>\"]+)[>\"]", line)
+        if m:
+            include_first_idx.setdefault(m.group(1), i)
+    findings: List[str] = []
+    for symbol, headers in _CPP_STD_HEADER_MAP.items():
+        pattern = re.compile(r"\bstd::" + re.escape(symbol) + r"\b")
+        use_idx: Optional[int] = None
+        for i, line in enumerate(lines):
+            if re.match(r"\s*#\s*include\b", line):
+                continue
+            if pattern.search(line):
+                use_idx = i
+                break
+        if use_idx is None:
+            continue
+        header_idx: Optional[int] = None
+        for h in headers:
+            if h in include_first_idx:
+                idx = include_first_idx[h]
+                if header_idx is None or idx < header_idx:
+                    header_idx = idx
+        if header_idx is None:
+            findings.append(
+                f"std::{symbol} used at line {use_idx + 1} but `#include <{headers[0]}>` is missing"
+            )
+        elif header_idx > use_idx:
+            findings.append(
+                f"std::{symbol} used at line {use_idx + 1} before `#include <{headers[0]}>` at line {header_idx + 1}"
+            )
+    if not findings:
+        return None
+    return f"{relative_path}: " + "; ".join(findings[:3])
+
+
 def _check_syntax(repo: Path, patch: str) -> List[str]:
     """Best-effort multi-language syntax check on touched files.
 
@@ -2067,12 +2171,20 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
             if result is None and suffix == ".js":
                 # node was unavailable; fall back to brace balance check.
                 result = _check_brace_balance_one(repo, relative_path)
+            if result is None:
+                # `.js` files frequently contain JSX in React projects that
+                # haven't migrated to `.jsx`. `_check_jsx_imports_one`
+                # self-gates when no JSX tag is present, so the cost on
+                # plain `.js` is one mmap + one regex scan.
+                result = _check_jsx_imports_one(repo, relative_path)
         elif suffix in {".json"}:
             result = _check_json_syntax_one(repo, relative_path)
         elif suffix == ".php":
             result = _check_php_syntax_one(repo, relative_path)
         elif suffix in {".kt", ".kts"}:
             result = _check_kotlin_imports_one(repo, relative_path)
+        elif suffix in _CPP_SUFFIXES:
+            result = _check_cpp_include_order_one(repo, relative_path)
         elif suffix in _BRACE_BALANCE_SUFFIXES:
             result = _check_brace_balance_one(repo, relative_path)
             if result is None and suffix in {".tsx", ".jsx"}:
@@ -2879,6 +2991,19 @@ _LITERAL_VERSION_RE = re.compile(
 _LITERAL_ALLCAPS_RE = re.compile(
     r"\b[A-Z][A-Z0-9]{2,}(?:[ _\-/]+[A-Z][A-Z0-9]+){1,6}\b"
 )
+# Web-style URL paths embedded in prose (e.g. "the endpoint at /verify ...").
+# Backtick/quote-wrapped paths are already covered by the earlier regexes;
+# this one captures bare-prose paths that the model otherwise paraphrases.
+_LITERAL_PATH_RE = re.compile(
+    r"(?<![\w/.-])(/[a-zA-Z][a-zA-Z0-9_-]{2,}(?:/[a-zA-Z0-9_:-]+)*)(?![\w/.])"
+)
+# Filesystem-style absolute paths that look like routes but aren't —
+# reject these to keep the literal block focused on API/route surface.
+_LITERAL_PATH_SYSTEM_FIRST = frozenset({
+    "etc", "usr", "var", "tmp", "bin", "sbin", "opt", "home", "root",
+    "proc", "sys", "dev", "mnt", "media", "boot", "lib", "lib64",
+    "users", "applications", "library", "system",
+})
 # Tokens that look like literals but are too generic to enforce verbatim.
 _LITERAL_DROP = {
     "true", "false", "null", "none", "yes", "no", "ok", "todo", "fixme",
@@ -2915,6 +3040,13 @@ def _extract_literal_spans(issue_text: str, *, max_spans: int = 24) -> List[str]
                 return out
     for m in _LITERAL_URL_RE.finditer(issue_text):
         if _try_add(m.group(0).rstrip(".,;:)")):
+            return out
+    for m in _LITERAL_PATH_RE.finditer(issue_text):
+        span = m.group(1)
+        first_seg = span[1:].split("/", 1)[0].lower()
+        if first_seg in _LITERAL_PATH_SYSTEM_FIRST:
+            continue
+        if _try_add(span):
             return out
     for m in _LITERAL_VERSION_RE.finditer(issue_text):
         span = m.group(0)
@@ -2966,6 +3098,8 @@ Repository summary:
 Before planning, read the ENTIRE issue above and identify every requirement (there may be more than one). Your patch must satisfy ALL of them — the LLM judge penalizes incomplete solutions.
 
 Strategy: the fix is typically in ONE specific function or block. Identify it precisely, then make the minimal edit that fixes the ROOT CAUSE.
+
+Touched-surface plan: in one short paragraph (no command output, no tool calls) enumerate the FULL set of files you intend to touch — the owner-of-bug file, every file whose interface/import depends on the change, any test-partner file, any nav/route/registration file, AND any demo / sample-data / Makefile / CHANGELOG / migration file the task language implies. Count them. If you spot one you didn't list, stop and re-plan before patching. Do NOT add files beyond what the task language implies; the goal is to surface omissions, not to inflate scope.
 
 If the preloaded snippets show the target code, edit them directly — do not re-read or run broad searches first. If the target is unclear, run ONE or TWO focused grep/sed -n commands to locate it, then edit immediately.
 
@@ -3161,13 +3295,25 @@ def build_self_check_prompt(patch: str, issue_text: str) -> str:
         "  - For every new/modified function signature: does each call site pass the right args? "
         "Forms calling server actions: do their FormData fields match the new signature?\n"
         "  - For every enum/typed field in the schema: does the patch use the enum/constant, not a plain string?\n"
+        "  - POLARITY CHECK: for any new helper that compares values, returns a boolean, "
+        "or maps a string to a type (`isNewer`, `is_admin`, `parseStatus`, header-type "
+        "annotations): re-read your implementation against its docstring or call site. "
+        "If the docstring says 'returns true when X is newer than Y', does the comparison "
+        "branch you wrote actually return that? Reversed-polarity helpers and `bool`-vs-`str` "
+        "type mix-ups are the most common subtle-bug loss in tight diffs.\n"
         f"{literal_bullet}"
         "  - If you have not yet run a functional test, run `pytest tests/test_<module>.py -x -q` "
         "or equivalent now. A passing test is required evidence of correctness.\n\n"
         "COMPLETENESS (LLM judge weight — high impact):\n"
         "  - List every requirement from the task. Is EACH ONE addressed by the patch?\n"
         "  - Companion tests broken by the source change are updated\n"
-        "  - No syntax errors or broken imports introduced\n\n"
+        "  - No syntax errors or broken imports introduced\n"
+        "  - ARRAY/HOOKS/EXPORTS DROP CHECK: when your patch re-emits an "
+        "array, hooks list, exports object, registration map, or any other "
+        "collection of named entries, every element that existed BEFORE your "
+        "edit must still be present AFTER, unless the task explicitly asked "
+        "to remove it. Re-emit the original list and ADD the requested "
+        "entries — do not rewrite from scratch and silently shrink the set.\n\n"
         "SCOPE (similarity score weight — medium impact):\n"
         "  - No whitespace-only, comment-only, or blank-line-only hunks\n"
         "  - No type annotation changes not required by the task\n"
